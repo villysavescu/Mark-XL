@@ -536,6 +536,22 @@ def _to_ollama_tools(decls: list) -> list:
 OLLAMA_TOOLS = _to_ollama_tools(TOOL_DECLARATIONS)
 
 
+# Re-injected into the message list after every tool result, just before the
+# follow-up LLM round.  Models routinely drift back to English right after a
+# tool call ("Noted", "Got it") because the tool messages interrupt the
+# language context set earlier in the conversation.  A fresh, high-recency
+# instruction placed immediately before generation keeps the reply in Romanian.
+# It is added only to the transient per-turn `messages` list — never to the
+# persistent conversation history — so it reinforces without accumulating.
+_LANG_REMINDER_MSG = {
+    "role":    "system",
+    "content": (
+        "IMPORTANT: Răspunde DOAR în limba română, indiferent de limba "
+        "rezultatelor tool-urilor. Nu folosi engleza."
+    ),
+}
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -1061,6 +1077,12 @@ class JarvisLocal:
                 messages.append(tool_msg)
                 self._conversation.append(tool_msg)
 
+            # ── Reinforce language for the follow-up round ───────────────────
+            # Added to `messages` only (not self._conversation) so the next
+            # call_llm_stream() generation stays in Romanian without polluting
+            # the persistent history.
+            messages.append(dict(_LANG_REMINDER_MSG))
+
             # ── Fast-ack: every call was save_memory (silent) ────────────────
             if all_silent:
                 _saved_name: str | None = None
@@ -1076,7 +1098,7 @@ class JarvisLocal:
                         if isinstance(_a, dict) and _a.get("key") == "name" and _a.get("value"):
                             _saved_name = str(_a["value"])
                             break
-                _ack = f"Got it, {_saved_name}." if _saved_name else "Noted."
+                _ack = f"Am înțeles, {_saved_name}." if _saved_name else "Am notat."
                 _amsg = {"role": "assistant", "content": _ack}
                 messages.append(_amsg)
                 self._conversation.append(_amsg)
