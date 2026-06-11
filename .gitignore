@@ -3,6 +3,8 @@ config/api_keys.json
 
 # Local user data
 memory/long_term.json
+# personal/business profile — keep local, see profile.example.md
+memory/profile.md
 
 # Python
 __pycache__/

@@ -104,6 +104,7 @@ def _get_base_dir() -> Path:
 BASE_DIR        = _get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
+PROFILE_PATH    = BASE_DIR / "memory" / "profile.md"
 
 SAMPLE_RATE_IN = 16_000
 BLOCK_SIZE     = 1_024
@@ -564,15 +565,42 @@ def _load_config() -> dict:
         return {}
 
 
+def _load_profile() -> str:
+    """
+    Load the static user/business profile (memory/profile.md).
+
+    This is PERMANENT information about the user and their business that never
+    changes mid-session.  It is folded into the static system prompt so it gets
+    KV-cache primed at warmup — exactly like the JARVIS protocol text — and costs
+    nothing on subsequent requests.
+
+    If the file is missing (or empty), this returns "" and everything works
+    normally without it.
+    """
+    try:
+        text = PROFILE_PATH.read_text(encoding="utf-8").strip()
+        return text
+    except Exception:
+        return ""
+
+
 def _load_system_prompt() -> str:
     try:
-        return PROMPT_PATH.read_text(encoding="utf-8")
+        base = PROMPT_PATH.read_text(encoding="utf-8")
     except Exception:
-        return (
+        base = (
             "You are JARVIS, Tony Stark's AI assistant. "
             "Be concise, direct, and always use the provided tools to complete tasks. "
             "Never simulate or guess results — always call the appropriate tool."
         )
+
+    # Append the static profile so it shares the cached KV prefix.  Loading it
+    # here (rather than in _build_system_prompt) keeps the warmup prompt and the
+    # real request prompt byte-identical, which is what the prefix cache needs.
+    profile = _load_profile()
+    if profile:
+        base = f"{base}\n\n[USER & BUSINESS PROFILE]\n{profile}"
+    return base
 
 
 # ---------------------------------------------------------------------------
