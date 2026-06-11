@@ -70,6 +70,8 @@ import sounddevice as sd
 
 from ui import JarvisUI
 from memory.memory_manager import load_memory, update_memory, format_memory_for_prompt
+from memory.conversation_logger import ConversationLogger
+from memory.reflection import reflect_on_conversation
 from core.llm_client import call_llm, call_llm_stream, get_llm_settings
 
 from actions.file_processor    import file_processor
@@ -89,6 +91,7 @@ from actions.dev_agent         import dev_agent
 from actions.web_search        import web_search as web_search_action
 from actions.computer_control  import computer_control
 from actions.game_updater      import game_updater
+from actions.generate_script    import generate_script
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +414,24 @@ TOOL_DECLARATIONS = [
         }
     },
     {
+        "name": "generate_script",
+        "description": (
+            "Generează un script NOU de social media în limba română, imitând stilul "
+            "scripturilor de top ale userului. Apelează acest tool ori de câte ori userul cere "
+            "un script, un text pentru reel/YouTube/carousel, sau spune lucruri de tipul: "
+            "'genereaza-mi un script despre X', 'scrie-mi un reel despre Y', "
+            "'fa-mi un script pentru un video despre Z'. Tema este obligatorie."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "tema":   {"type": "STRING", "description": "Subiectul scriptului, ex: 'cum sa scapi de procrastinare'"},
+                "format": {"type": "STRING", "description": "reel | youtube | carousel (default: reel)"},
+            },
+            "required": ["tema"]
+        }
+    },
+    {
         "name": "shutdown_jarvis",
         "description": (
             "Shuts down the assistant completely. "
@@ -482,6 +503,17 @@ TOOL_DECLARATIONS = [
             },
             "required": ["category", "key", "value"]
         }
+    },
+    {
+        "name": "reflect_on_conversation",
+        "description": (
+            "Analizează conversația curentă și învață din ea: extrage fapte noi despre "
+            "utilizator, corecturi/feedback și preferințe observate, apoi le salvează în "
+            "memoria pe termen lung. Apelează acest tool când utilizatorul cere explicit: "
+            "'invata din conversatie', 'reflecteaza', 'tine minte ce am discutat', "
+            "'analizeaza ce am vorbit'. Rulează oricum automat la închidere."
+        ),
+        "parameters": {"type": "OBJECT", "properties": {}}
     },
 ]
 
@@ -683,8 +715,17 @@ class JarvisLocal:
         self._text_queue:     queue.Queue = queue.Queue()
         self._tts_queue:      queue.Queue = queue.Queue()
         self._conversation:   list[dict]  = []
+        self._conv_logger     = ConversationLogger()
+        self._reflected       = False   # guard against double reflection
 
         self.ui.on_text_command = self._on_text_command
+
+        # Reflect on the conversation when the app exits normally (window
+        # close / Ctrl+C → mainloop returns → interpreter exit fires atexit).
+        # The shutdown_jarvis path calls os._exit(), which bypasses atexit, so
+        # that path triggers reflection explicitly before exiting.
+        import atexit
+        atexit.register(self._reflect_on_exit)
 
     # ------------------------------------------------------------------
     # System prompt
@@ -833,6 +874,28 @@ class JarvisLocal:
         self._text_queue.put(text)
 
     # ------------------------------------------------------------------
+    # Conversation logging + reflection
+    # ------------------------------------------------------------------
+
+    def _log_conversation(self) -> None:
+        """Crash-safe: persist the full conversation after every exchange."""
+        try:
+            self._conv_logger.save(self._conversation)
+        except Exception as e:
+            print(f"[JARVIS] Conversation log error: {e}")
+
+    def _reflect_on_exit(self) -> None:
+        """Run the reflection pass once, on shutdown. Best-effort, never raises."""
+        if self._reflected:
+            return
+        self._reflected = True
+        try:
+            summary = reflect_on_conversation(self._conversation, player=self.ui)
+            print(f"[JARVIS] Reflection: {summary}")
+        except Exception as e:
+            print(f"[JARVIS] Reflection on exit failed: {e}")
+
+    # ------------------------------------------------------------------
     # Tool execution (routing unchanged from original)
     # ------------------------------------------------------------------
 
@@ -940,11 +1003,24 @@ class JarvisLocal:
                 r = flight_finder(parameters=args, player=self.ui)
                 result = r or "Done."
 
+            elif name == "generate_script":
+                r = generate_script(parameters=args, player=self.ui)
+                result = r or "Done."
+
+            elif name == "reflect_on_conversation":
+                # Manual mid-session run — does NOT set the _reflected guard, so
+                # the automatic reflection still runs at exit over the full chat.
+                r = reflect_on_conversation(self._conversation, player=self.ui)
+                result = r or "Reflecție finalizată."
+
             elif name == "shutdown_jarvis":
                 self.ui.write_log("SYS: Shutdown requested.")
 
                 def _shutdown():
                     import time, os
+                    # os._exit() bypasses atexit, so reflect explicitly here
+                    # before tearing the process down.
+                    self._reflect_on_exit()
                     self.speak("Goodbye.")
                     time.sleep(2.5)
                     os._exit(0)
@@ -987,14 +1063,17 @@ class JarvisLocal:
         self.ui.write_log(f"You: {user_text}")
 
         self._conversation.append({"role": "user", "content": user_text})
+        # Crash-safe: persist as soon as the user message lands, before the LLM
+        # round — if anything dies mid-turn the user's words are already logged.
+        self._log_conversation()
 
+        # self._conversation is the FULL session history (kept for logging +
+        # reflection so nothing is lost).  The LLM only needs recent context, so
+        # send just the last MAX_HISTORY messages — without truncating history.
         MAX_HISTORY = 10
-        if len(self._conversation) > MAX_HISTORY:
-            self._conversation = self._conversation[-MAX_HISTORY:]
-
         messages = [
             {"role": "system", "content": self._build_system_prompt()}
-        ] + list(self._conversation)
+        ] + list(self._conversation[-MAX_HISTORY:])
 
         # Tools whose output needs a second LLM round to summarise/interpret.
         # Everything else returns a user-ready string → speak directly.
@@ -1143,6 +1222,9 @@ class JarvisLocal:
                 self.ui.write_log(f"Jarvis: {_reply}")
                 self.speak(_reply)
                 break
+
+        # Persist the completed turn (assistant + any tool messages).
+        self._log_conversation()
 
         if not self.ui.muted:
             self.ui.set_state("LISTENING")

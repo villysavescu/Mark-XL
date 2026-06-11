@@ -1,0 +1,21 @@
+# SCRIPTURILE MELE DE TOP
+#
+# Lipește aici scripturile tale care au performat cel mai bine, cu metricile lor.
+# Tool-ul generate_script citește acest fișier și imită stilul, vocabularul și
+# ritmul exemplelor de mai jos când generează un script nou.
+#
+# Format recomandat pentru fiecare exemplu (separă scripturile cu o linie goală):
+#
+# --- SCRIPT 1 ---
+# Performanță: 1.2M vizualizări, 45k like-uri, 800 DM-uri
+# Format: reel
+#
+# [Hook] ...
+# [Problemă] ...
+# [Soluție] ...
+# [CTA] Scrie-mi DM cu COACH
+#
+# --- SCRIPT 2 ---
+# ...
+#
+# Înlocuiește acest text cu scripturile tale reale.
