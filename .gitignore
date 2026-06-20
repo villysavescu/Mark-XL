@@ -1,0 +1,17 @@
+# Secrets — contains live API keys, never commit
+config/api_keys.json
+
+# Local user data
+memory/long_term.json
+# personal/business profile — keep local, see profile.example.md
+memory/profile.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtualenv
+venv/
+.venv/

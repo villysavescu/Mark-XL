@@ -70,6 +70,8 @@ import sounddevice as sd
 
 from ui import JarvisUI
 from memory.memory_manager import load_memory, update_memory, format_memory_for_prompt
+from memory.conversation_logger import ConversationLogger
+from memory.reflection import reflect_on_conversation
 from core.llm_client import call_llm, call_llm_stream, get_llm_settings
 
 from actions.file_processor    import file_processor
@@ -89,6 +91,8 @@ from actions.dev_agent         import dev_agent
 from actions.web_search        import web_search as web_search_action
 from actions.computer_control  import computer_control
 from actions.game_updater      import game_updater
+from actions.generate_script    import generate_script
+from actions.morning_brief     import morning_brief as morning_brief_action
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +108,7 @@ def _get_base_dir() -> Path:
 BASE_DIR        = _get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
+PROFILE_PATH    = BASE_DIR / "memory" / "profile.md"
 
 SAMPLE_RATE_IN = 16_000
 BLOCK_SIZE     = 1_024
@@ -410,6 +415,34 @@ TOOL_DECLARATIONS = [
         }
     },
     {
+        "name": "generate_script",
+        "description": (
+            "Generează un script NOU de social media în limba română, imitând stilul "
+            "scripturilor de top ale userului. Apelează acest tool ori de câte ori userul cere "
+            "un script, un text pentru reel/YouTube/carousel, sau spune lucruri de tipul: "
+            "'genereaza-mi un script despre X', 'scrie-mi un reel despre Y', "
+            "'fa-mi un script pentru un video despre Z'. Tema este obligatorie."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "tema":   {"type": "STRING", "description": "Subiectul scriptului, ex: 'cum sa scapi de procrastinare'"},
+                "format": {"type": "STRING", "description": "reel | youtube | carousel (default: reel)"},
+            },
+            "required": ["tema"]
+        }
+    },
+    {
+        "name": "morning_brief",
+        "description": (
+            "Compune și citește briefingul de dimineață: vremea din Piatra Neamț, "
+            "câteva știri relevante și mementourile/notițele active ale lui Vili. "
+            "Apelează acest tool când userul cere explicit briefingul de dimineață "
+            "('fa-mi briefingul', 'ce e nou azi', 'cum e vremea si ce stiri sunt azi')."
+        ),
+        "parameters": {"type": "OBJECT", "properties": {}}
+    },
+    {
         "name": "shutdown_jarvis",
         "description": (
             "Shuts down the assistant completely. "
@@ -482,6 +515,17 @@ TOOL_DECLARATIONS = [
             "required": ["category", "key", "value"]
         }
     },
+    {
+        "name": "reflect_on_conversation",
+        "description": (
+            "Analizează conversația curentă și învață din ea: extrage fapte noi despre "
+            "utilizator, corecturi/feedback și preferințe observate, apoi le salvează în "
+            "memoria pe termen lung. Apelează acest tool când utilizatorul cere explicit: "
+            "'invata din conversatie', 'reflecteaza', 'tine minte ce am discutat', "
+            "'analizeaza ce am vorbit'. Rulează oricum automat la închidere."
+        ),
+        "parameters": {"type": "OBJECT", "properties": {}}
+    },
 ]
 
 
@@ -536,6 +580,22 @@ def _to_ollama_tools(decls: list) -> list:
 OLLAMA_TOOLS = _to_ollama_tools(TOOL_DECLARATIONS)
 
 
+# Re-injected into the message list after every tool result, just before the
+# follow-up LLM round.  Models routinely drift back to English right after a
+# tool call ("Noted", "Got it") because the tool messages interrupt the
+# language context set earlier in the conversation.  A fresh, high-recency
+# instruction placed immediately before generation keeps the reply in Romanian.
+# It is added only to the transient per-turn `messages` list — never to the
+# persistent conversation history — so it reinforces without accumulating.
+_LANG_REMINDER_MSG = {
+    "role":    "system",
+    "content": (
+        "IMPORTANT: Răspunde DOAR în limba română, indiferent de limba "
+        "rezultatelor tool-urilor. Nu folosi engleza."
+    ),
+}
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -548,15 +608,42 @@ def _load_config() -> dict:
         return {}
 
 
+def _load_profile() -> str:
+    """
+    Load the static user/business profile (memory/profile.md).
+
+    This is PERMANENT information about the user and their business that never
+    changes mid-session.  It is folded into the static system prompt so it gets
+    KV-cache primed at warmup — exactly like the JARVIS protocol text — and costs
+    nothing on subsequent requests.
+
+    If the file is missing (or empty), this returns "" and everything works
+    normally without it.
+    """
+    try:
+        text = PROFILE_PATH.read_text(encoding="utf-8").strip()
+        return text
+    except Exception:
+        return ""
+
+
 def _load_system_prompt() -> str:
     try:
-        return PROMPT_PATH.read_text(encoding="utf-8")
+        base = PROMPT_PATH.read_text(encoding="utf-8")
     except Exception:
-        return (
+        base = (
             "You are JARVIS, Tony Stark's AI assistant. "
             "Be concise, direct, and always use the provided tools to complete tasks. "
             "Never simulate or guess results — always call the appropriate tool."
         )
+
+    # Append the static profile so it shares the cached KV prefix.  Loading it
+    # here (rather than in _build_system_prompt) keeps the warmup prompt and the
+    # real request prompt byte-identical, which is what the prefix cache needs.
+    profile = _load_profile()
+    if profile:
+        base = f"{base}\n\n[USER & BUSINESS PROFILE]\n{profile}"
+    return base
 
 
 # ---------------------------------------------------------------------------
@@ -639,8 +726,17 @@ class JarvisLocal:
         self._text_queue:     queue.Queue = queue.Queue()
         self._tts_queue:      queue.Queue = queue.Queue()
         self._conversation:   list[dict]  = []
+        self._conv_logger     = ConversationLogger()
+        self._reflected       = False   # guard against double reflection
 
         self.ui.on_text_command = self._on_text_command
+
+        # Reflect on the conversation when the app exits normally (window
+        # close / Ctrl+C → mainloop returns → interpreter exit fires atexit).
+        # The shutdown_jarvis path calls os._exit(), which bypasses atexit, so
+        # that path triggers reflection explicitly before exiting.
+        import atexit
+        atexit.register(self._reflect_on_exit)
 
     # ------------------------------------------------------------------
     # System prompt
@@ -789,6 +885,28 @@ class JarvisLocal:
         self._text_queue.put(text)
 
     # ------------------------------------------------------------------
+    # Conversation logging + reflection
+    # ------------------------------------------------------------------
+
+    def _log_conversation(self) -> None:
+        """Crash-safe: persist the full conversation after every exchange."""
+        try:
+            self._conv_logger.save(self._conversation)
+        except Exception as e:
+            print(f"[JARVIS] Conversation log error: {e}")
+
+    def _reflect_on_exit(self) -> None:
+        """Run the reflection pass once, on shutdown. Best-effort, never raises."""
+        if self._reflected:
+            return
+        self._reflected = True
+        try:
+            summary = reflect_on_conversation(self._conversation, player=self.ui)
+            print(f"[JARVIS] Reflection: {summary}")
+        except Exception as e:
+            print(f"[JARVIS] Reflection on exit failed: {e}")
+
+    # ------------------------------------------------------------------
     # Tool execution (routing unchanged from original)
     # ------------------------------------------------------------------
 
@@ -896,11 +1014,28 @@ class JarvisLocal:
                 r = flight_finder(parameters=args, player=self.ui)
                 result = r or "Done."
 
+            elif name == "generate_script":
+                r = generate_script(parameters=args, player=self.ui)
+                result = r or "Done."
+
+            elif name == "morning_brief":
+                r = morning_brief_action(parameters=args, player=self.ui)
+                result = r or "Briefingul de dimineață nu este disponibil."
+
+            elif name == "reflect_on_conversation":
+                # Manual mid-session run — does NOT set the _reflected guard, so
+                # the automatic reflection still runs at exit over the full chat.
+                r = reflect_on_conversation(self._conversation, player=self.ui)
+                result = r or "Reflecție finalizată."
+
             elif name == "shutdown_jarvis":
                 self.ui.write_log("SYS: Shutdown requested.")
 
                 def _shutdown():
                     import time, os
+                    # os._exit() bypasses atexit, so reflect explicitly here
+                    # before tearing the process down.
+                    self._reflect_on_exit()
                     self.speak("Goodbye.")
                     time.sleep(2.5)
                     os._exit(0)
@@ -943,14 +1078,17 @@ class JarvisLocal:
         self.ui.write_log(f"You: {user_text}")
 
         self._conversation.append({"role": "user", "content": user_text})
+        # Crash-safe: persist as soon as the user message lands, before the LLM
+        # round — if anything dies mid-turn the user's words are already logged.
+        self._log_conversation()
 
+        # self._conversation is the FULL session history (kept for logging +
+        # reflection so nothing is lost).  The LLM only needs recent context, so
+        # send just the last MAX_HISTORY messages — without truncating history.
         MAX_HISTORY = 10
-        if len(self._conversation) > MAX_HISTORY:
-            self._conversation = self._conversation[-MAX_HISTORY:]
-
         messages = [
             {"role": "system", "content": self._build_system_prompt()}
-        ] + list(self._conversation)
+        ] + list(self._conversation[-MAX_HISTORY:])
 
         # Tools whose output needs a second LLM round to summarise/interpret.
         # Everything else returns a user-ready string → speak directly.
@@ -1061,6 +1199,12 @@ class JarvisLocal:
                 messages.append(tool_msg)
                 self._conversation.append(tool_msg)
 
+            # ── Reinforce language for the follow-up round ───────────────────
+            # Added to `messages` only (not self._conversation) so the next
+            # call_llm_stream() generation stays in Romanian without polluting
+            # the persistent history.
+            messages.append(dict(_LANG_REMINDER_MSG))
+
             # ── Fast-ack: every call was save_memory (silent) ────────────────
             if all_silent:
                 _saved_name: str | None = None
@@ -1076,7 +1220,7 @@ class JarvisLocal:
                         if isinstance(_a, dict) and _a.get("key") == "name" and _a.get("value"):
                             _saved_name = str(_a["value"])
                             break
-                _ack = f"Got it, {_saved_name}." if _saved_name else "Noted."
+                _ack = f"Am înțeles, {_saved_name}." if _saved_name else "Am notat."
                 _amsg = {"role": "assistant", "content": _ack}
                 messages.append(_amsg)
                 self._conversation.append(_amsg)
@@ -1093,6 +1237,9 @@ class JarvisLocal:
                 self.ui.write_log(f"Jarvis: {_reply}")
                 self.speak(_reply)
                 break
+
+        # Persist the completed turn (assistant + any tool messages).
+        self._log_conversation()
 
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
@@ -1274,6 +1421,16 @@ class JarvisLocal:
                     self.ui.set_startup_status("● All systems ready.")
                     self.ui.hide_startup_panel()
                     self.speak("Jarvis fully online.")
+
+                    # ── Auto morning briefing — 05:00 to 11:00 only ─────────
+                    hour = datetime.now().hour
+                    if 5 <= hour < 11:
+                        try:
+                            briefing = morning_brief_action(parameters={}, player=self.ui)
+                            if briefing:
+                                self.speak(briefing)
+                        except Exception as e:
+                            self.ui.write_log(f"ERR: Morning brief — {e}")
                 except Exception as e:
                     import traceback as _tb; _tb.print_exc()
                     self.ui.write_log(f"ERR: TTS — {e}")

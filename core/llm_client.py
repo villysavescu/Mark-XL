@@ -17,6 +17,7 @@ Supports two backends — selected via  "llm_provider"  in config/api_keys.json:
         supports function/tool calls (e.g. Qwen2.5, Llama-3.1, Mistral).
 """
 import json
+import os
 import re
 import subprocess
 import sys
@@ -25,6 +26,102 @@ from pathlib import Path
 from typing import Generator
 
 import requests
+
+def _openai_headers() -> dict:
+    key = _load_config().get("openai_api_key", "")
+    return {"Authorization": f"Bearer {key}"} if key else {}
+
+
+# Toggle full-payload logging for the OpenAI/Groq branch.  On by default so the
+# exact JSON we POST is visible in the console (set MARKXL_LOG_LLM_PAYLOAD=0 to
+# silence).  Groq returns HTTP 400 with an EMPTY body on malformed tool-call
+# history, so the request payload is the only way to see what went wrong.
+def _payload_logging_enabled() -> bool:
+    return os.environ.get("MARKXL_LOG_LLM_PAYLOAD", "1") not in ("0", "false", "False", "")
+
+
+def _log_openai_payload(endpoint: str, payload: dict) -> None:
+    if not _payload_logging_enabled():
+        return
+    try:
+        body = json.dumps(payload, indent=2, ensure_ascii=False)
+    except Exception:
+        body = repr(payload)
+    print(f"\n[LLM] ── POST {endpoint} ──────────────────────────────")
+    print(body)
+    print("[LLM] ────────────────────────────────────────────────────\n")
+
+
+def _normalize_history_openai(messages: list) -> list:
+    """
+    Rewrite a message history into STRICT OpenAI / Groq tool-calling format.
+
+    The conversation history in main.py is built from the streaming "done"
+    event, which carries tool calls in Ollama-friendly shape:
+
+        {"id": "...", "function": {"name": "x", "arguments": {<dict>}}}
+
+    Ollama accepts that as-is, but Groq validates the OpenAI schema strictly and
+    rejects the whole request with **HTTP 400 and an empty response body** when a
+    prior assistant message contains tool calls that:
+
+        • have ``function.arguments`` as an object instead of a JSON string,
+        • are missing the ``"type": "function"`` discriminator,
+        • are missing an ``id``, or
+        • are followed by a ``role:"tool"`` message without a matching
+          ``tool_call_id``.
+
+    This is why plain chats work but anything *after* a tool call (e.g. the
+    save_memory → follow-up question flow) blows up.  We normalise only on the
+    OpenAI branch; the Ollama branch keeps its native format untouched.
+    """
+    out:         list      = []
+    auto_id                = 0
+    pending_ids: list[str] = []   # tool_call ids awaiting their role:"tool" reply
+
+    for msg in messages:
+        role = msg.get("role")
+
+        if role == "assistant" and msg.get("tool_calls"):
+            new_tcs:     list = []
+            pending_ids       = []
+            for tc in msg["tool_calls"]:
+                fn    = tc.get("function", {}) or {}
+                tc_id = tc.get("id") or f"call_{auto_id}"
+                auto_id += 1
+                args = fn.get("arguments", {})
+                if not isinstance(args, str):
+                    # Groq requires arguments as a JSON-encoded STRING.
+                    args = json.dumps(args, ensure_ascii=False)
+                new_tcs.append({
+                    "id":   tc_id,
+                    "type": "function",
+                    "function": {"name": fn.get("name", ""), "arguments": args},
+                })
+                pending_ids.append(tc_id)
+            out.append({
+                "role":       "assistant",
+                "content":    msg.get("content") or "",
+                "tool_calls": new_tcs,
+            })
+
+        elif role == "tool":
+            new_msg = dict(msg)
+            existing = new_msg.get("tool_call_id")
+            if existing and existing in pending_ids:
+                pending_ids.remove(existing)
+            elif pending_ids:
+                # Match by position to the preceding assistant tool call(s).
+                new_msg["tool_call_id"] = pending_ids.pop(0)
+            elif not existing:
+                new_msg["tool_call_id"] = f"call_{auto_id}"
+                auto_id += 1
+            out.append(new_msg)
+
+        else:
+            out.append(msg)
+
+    return out
 
 # Matches a sentence boundary: [.!?] followed by whitespace, or a blank line.
 # Avoids splitting on decimals (3.5) because those have no space after the dot.
@@ -156,7 +253,7 @@ def warmup_model(system_prompt: str | None = None) -> bool:
             "max_tokens": 1,
         }
         try:
-            resp = requests.post(f"{url}/v1/chat/completions", json=payload, timeout=180)
+            resp = requests.post(f"{url}/v1/chat/completions", json=payload, headers=_openai_headers(), timeout=180)
             resp.raise_for_status()
             print(f"[LLM] '{model}' ready (OpenAI-compatible server).")
             return True
@@ -172,7 +269,7 @@ def warmup_model(system_prompt: str | None = None) -> bool:
         "keep_alive": -1,
         # num_gpu:99 → push ALL transformer layers to GPU (Ollama caps at available)
         # This is safe even without a GPU — Ollama silently ignores if n_gpu_layers=0
-        "options":    {"num_predict": 1, "num_gpu": 99},
+        "options":    {"num_predict": 1, "num_gpu": 0},
     }
     try:
         resp = requests.post(f"{url}/api/chat", json=payload, timeout=180)
@@ -195,7 +292,7 @@ def get_llm_settings() -> tuple[str, str]:
 def call_llm(
     messages: list,
     tools:    list | None = None,
-    timeout:  int = 120,
+    timeout:  int = 600,
 ) -> dict:
     """
     Non-streaming chat request.  Routes to Ollama or OpenAI-compatible backend.
@@ -210,15 +307,16 @@ def call_llm(
         endpoint = f"{url}/v1/chat/completions"
         payload: dict = {
             "model":      model,
-            "messages":   messages,
+            "messages":   _normalize_history_openai(messages),
             "stream":     False,
             "max_tokens": 150,
         }
         if tools:
             payload["tools"]       = tools
             payload["tool_choice"] = "auto"
+        _log_openai_payload(endpoint, payload)
         try:
-            resp = requests.post(endpoint, json=payload, timeout=timeout)
+            resp = requests.post(endpoint, json=payload, headers=_openai_headers(), timeout=timeout)
             resp.raise_for_status()
             choice = resp.json().get("choices", [{}])[0]
             msg    = choice.get("message", {})
@@ -252,13 +350,13 @@ def call_llm(
         "messages":   messages,
         "stream":     False,
         "keep_alive": -1,
-        "options":    {"num_predict": 150, "num_gpu": 99},
+        "options":    {"num_predict": 150, "num_gpu": 0},
     }
     if tools:
         payload["tools"] = tools
 
     try:
-        resp = requests.post(endpoint, json=payload, timeout=timeout)
+        resp = requests.post(endpoint, json=payload, headers=_openai_headers(), timeout=timeout)
         resp.raise_for_status()
         data = resp.json()
         msg  = data.get("message", {})
@@ -270,7 +368,7 @@ def call_llm(
         print(f"[LLM] ConnectionError — trying to restart Ollama… ({e})")
         if ensure_ollama_running():
             try:
-                resp = requests.post(endpoint, json=payload, timeout=timeout)
+                resp = requests.post(endpoint, json=payload, headers=_openai_headers(), timeout=timeout)
                 resp.raise_for_status()
                 data = resp.json()
                 msg  = data.get("message", {})
@@ -305,7 +403,7 @@ def call_llm_text(
     Used by planner, executor, error_handler, code_helper, dev_agent.
     """
     url, default_model = get_llm_settings()
-    endpoint = f"{url}/api/chat"
+    provider = get_llm_provider()
     m        = model or default_model
 
     messages: list[dict] = []
@@ -313,16 +411,52 @@ def call_llm_text(
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
+    # ── OpenAI-compatible (Groq, LM Studio, …) ──────────────────────────────
+    # Text-only: no tools, no prior tool calls, so no history normalisation
+    # needed — just the OpenAI chat-completions shape.
+    if provider == "openai":
+        endpoint = f"{url}/v1/chat/completions"
+        payload  = {"model": m, "messages": messages, "stream": False, "max_tokens": 600}
+        _log_openai_payload(endpoint, payload)
+
+        # One retry with backoff for TRANSIENT failures only: network errors,
+        # timeouts, rate limits (429), and server errors (5xx).  A 4xx (e.g. a
+        # malformed request / bad key) won't fix itself on retry, so we fail fast.
+        for _attempt in range(2):
+            try:
+                resp = requests.post(endpoint, json=payload, headers=_openai_headers(), timeout=timeout)
+                resp.raise_for_status()
+                choice = resp.json().get("choices", [{}])[0]
+                return (choice.get("message", {}).get("content") or "").strip()
+            except requests.exceptions.HTTPError as e:
+                status = e.response.status_code
+                print(f"[LLM] OpenAI text error body: {e.response.text[:500]}")
+                if status in (429, 500, 502, 503, 504) and _attempt == 0:
+                    print(f"[LLM] Transient HTTP {status} — retrying in 1.5 s…")
+                    time.sleep(1.5)
+                    continue
+                raise RuntimeError(f"OpenAI-compatible text call failed: {status}")
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                if _attempt == 0:
+                    print(f"[LLM] {type(e).__name__} — retrying in 1.5 s…")
+                    time.sleep(1.5)
+                    continue
+                raise RuntimeError(f"OpenAI-compatible text call failed: {e}")
+            except Exception as e:
+                raise RuntimeError(f"OpenAI-compatible text call failed: {e}")
+
+    # ── Ollama ──────────────────────────────────────────────────────────────
+    endpoint = f"{url}/api/chat"
     payload = {"model": m, "messages": messages, "stream": False, "keep_alive": -1, "options": {"num_predict": 600}}
 
     try:
-        resp = requests.post(endpoint, json=payload, timeout=timeout)
+        resp = requests.post(endpoint, json=payload, headers=_openai_headers(), timeout=timeout)
         resp.raise_for_status()
         return (resp.json().get("message", {}).get("content") or "").strip()
     except requests.exceptions.ConnectionError:
         if ensure_ollama_running():
             try:
-                resp = requests.post(endpoint, json=payload, timeout=timeout)
+                resp = requests.post(endpoint, json=payload, headers=_openai_headers(), timeout=timeout)
                 resp.raise_for_status()
                 return (resp.json().get("message", {}).get("content") or "").strip()
             except Exception:
@@ -351,7 +485,7 @@ def _stream_openai(
 
     payload: dict = {
         "model":      model,
-        "messages":   messages,
+        "messages":   _normalize_history_openai(messages),
         "stream":     True,
         "max_tokens": 150,
     }
@@ -359,8 +493,10 @@ def _stream_openai(
         payload["tools"]       = tools
         payload["tool_choice"] = "auto"
 
+    _log_openai_payload(endpoint, payload)
+
     try:
-        with requests.post(endpoint, json=payload, timeout=timeout, stream=True) as resp:
+        with requests.post(endpoint, json=payload, headers=_openai_headers(), timeout=timeout, stream=True) as resp:
             resp.raise_for_status()
             full_content = ""
             buf          = ""
@@ -446,7 +582,7 @@ def _stream_openai(
     except requests.exceptions.Timeout:
         raise RuntimeError("OpenAI-compatible stream timed out.")
     except requests.exceptions.HTTPError as e:
-        raise RuntimeError(f"OpenAI-compatible HTTP error: {e.response.status_code}")
+        print(f"[LLM] Groq error body: {e.response.text[:500]}"); raise RuntimeError(f"OpenAI-compatible HTTP error: {e.response.status_code}")
     except Exception as e:
         raise RuntimeError(f"OpenAI-compatible stream failed: {e}")
 
@@ -454,7 +590,7 @@ def _stream_openai(
 def call_llm_stream(
     messages: list,
     tools:    list | None = None,
-    timeout:  int = 120,
+    timeout:  int = 600,
 ) -> Generator[dict, None, None]:
     """
     Streaming chat request.  Routes to Ollama or OpenAI-compatible backend.
@@ -481,13 +617,13 @@ def call_llm_stream(
         "keep_alive": -1,
         # 150 tokens ≈ 100 words ≈ 3-4 sentences — enough for any voice reply.
         # num_gpu:99 pushes all layers to GPU; num_thread removed (Ollama auto-tunes).
-        "options":    {"num_predict": 150, "num_gpu": 99},
+        "options":    {"num_predict": 150, "num_gpu": 0},
     }
     if tools:
         payload["tools"] = tools
 
     def _do_stream() -> Generator[dict, None, None]:
-        with requests.post(endpoint, json=payload, timeout=timeout, stream=True) as resp:
+        with requests.post(endpoint, json=payload, headers=_openai_headers(), timeout=timeout, stream=True) as resp:
             resp.raise_for_status()
             full_content = ""
             tool_calls:  list = []
@@ -550,3 +686,5 @@ def call_llm_stream(
     except Exception as e:
         print(f"[LLM] Stream error: {type(e).__name__}: {e}")
         raise RuntimeError(f"LLM stream failed: {e}")
+
+
