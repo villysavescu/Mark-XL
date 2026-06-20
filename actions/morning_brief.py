@@ -2,6 +2,7 @@
 composed by the LLM in the voice of a warm-but-direct British butler speaking Romanian."""
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import requests
@@ -19,6 +20,19 @@ BASE_DIR        = _get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 
 CITY = "Piatra Neamț,RO"
+
+_RO_DAYS   = ["luni", "marți", "miercuri", "joi", "vineri", "sâmbătă", "duminică"]
+_RO_MONTHS = [
+    "ianuarie", "februarie", "martie", "aprilie", "mai", "iunie",
+    "iulie", "august", "septembrie", "octombrie", "noiembrie", "decembrie",
+]
+
+
+def _today_ro(now: datetime | None = None) -> str:
+    now = now or datetime.now()
+    day_name   = _RO_DAYS[now.weekday()]
+    month_name = _RO_MONTHS[now.month - 1]
+    return f"{day_name}, {now.day} {month_name} {now.year}"
 
 
 def _load_api_keys() -> dict:
@@ -91,6 +105,7 @@ def _get_reminders() -> list[str]:
 
 
 def _compose_briefing(weather: str, news: list[str], reminders: list[str]) -> str:
+    today_str       = _today_ro()
     news_block      = "\n".join(f"- {h}" for h in news) if news else "- (nicio știre disponibilă)"
     reminders_block = "\n".join(f"- {r}" for r in reminders) if reminders else "- (niciun memento activ)"
 
@@ -101,6 +116,8 @@ def _compose_briefing(weather: str, news: list[str], reminders: list[str]) -> st
         "Maxim 150-200 de cuvinte. Răspunde STRICT cu textul briefingului, fără titluri, fără explicații."
     )
     prompt = (
+        f"Astăzi este {today_str}. Folosește EXACT această dată dacă o menționezi — "
+        "nu o ghici și nu o schimba.\n\n"
         f"Vremea de azi: {weather}\n\n"
         f"Știri de azi:\n{news_block}\n\n"
         f"Notițe și planuri active ale lui Vili:\n{reminders_block}\n\n"
