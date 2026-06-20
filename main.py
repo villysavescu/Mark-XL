@@ -92,6 +92,7 @@ from actions.web_search        import web_search as web_search_action
 from actions.computer_control  import computer_control
 from actions.game_updater      import game_updater
 from actions.generate_script    import generate_script
+from actions.morning_brief     import morning_brief as morning_brief_action
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +431,16 @@ TOOL_DECLARATIONS = [
             },
             "required": ["tema"]
         }
+    },
+    {
+        "name": "morning_brief",
+        "description": (
+            "Compune și citește briefingul de dimineață: vremea din Piatra Neamț, "
+            "câteva știri relevante și mementourile/notițele active ale lui Vili. "
+            "Apelează acest tool când userul cere explicit briefingul de dimineață "
+            "('fa-mi briefingul', 'ce e nou azi', 'cum e vremea si ce stiri sunt azi')."
+        ),
+        "parameters": {"type": "OBJECT", "properties": {}}
     },
     {
         "name": "shutdown_jarvis",
@@ -1007,6 +1018,10 @@ class JarvisLocal:
                 r = generate_script(parameters=args, player=self.ui)
                 result = r or "Done."
 
+            elif name == "morning_brief":
+                r = morning_brief_action(parameters=args, player=self.ui)
+                result = r or "Briefingul de dimineață nu este disponibil."
+
             elif name == "reflect_on_conversation":
                 # Manual mid-session run — does NOT set the _reflected guard, so
                 # the automatic reflection still runs at exit over the full chat.
@@ -1406,6 +1421,16 @@ class JarvisLocal:
                     self.ui.set_startup_status("● All systems ready.")
                     self.ui.hide_startup_panel()
                     self.speak("Jarvis fully online.")
+
+                    # ── Auto morning briefing — 05:00 to 11:00 only ─────────
+                    hour = datetime.now().hour
+                    if 5 <= hour < 11:
+                        try:
+                            briefing = morning_brief_action(parameters={}, player=self.ui)
+                            if briefing:
+                                self.speak(briefing)
+                        except Exception as e:
+                            self.ui.write_log(f"ERR: Morning brief — {e}")
                 except Exception as e:
                     import traceback as _tb; _tb.print_exc()
                     self.ui.write_log(f"ERR: TTS — {e}")
